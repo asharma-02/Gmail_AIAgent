@@ -20,3 +20,4 @@ data/
 # Gmail OAuth credentials
 token.json
 credentials.json
+*.pyc
