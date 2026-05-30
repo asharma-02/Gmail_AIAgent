@@ -10,6 +10,7 @@ from src.models.types import (
     TechnicalLanguageUsage,
     ToneProfile,
 )
+from src.models.types import ContextSummary
 
 
 def _email(subject: str = "Follow-up on proposal", body: str = "Hi, just checking in."):
@@ -157,3 +158,25 @@ def test_draft_generator_returns_human_prompt_without_draft():
     assert result.draft_type == "human_prompt"
     assert result.needs_human_input is True
     assert result.human_prompt is not None
+
+def test_draft_generator_compatibility_method_for_orchestrator():
+    generator = DraftGenerator()
+
+    result = generator.generate_from_orchestrator_response(
+        recipient="sarah@example.com",
+        llm_response_text=(
+            "Subject: Re: Follow-up\n"
+            "Body:\n"
+            "Hi Sarah,\n\nThanks for following up.\n\nBest regards,"
+        ),
+        instruction_text="Draft a reply to Sarah.",
+        context_summary=ContextSummary(),
+    )
+
+    assert result.draft is not None
+    assert result.draft.recipient == "sarah@example.com"
+    assert result.draft.subject == "Re: Follow-up"
+    assert "Thanks for following up" in result.draft.body
+    assert result.draft_type == "full"
+    assert result.needs_human_input is False
+    

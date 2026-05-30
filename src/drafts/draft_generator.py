@@ -113,6 +113,51 @@ class DraftGenerator:
             ],
         )
 
+    def generate_from_orchestrator_response(
+        self,
+        recipient: str,
+        llm_response_text: str,
+        instruction_text: str,
+        context_summary: ContextSummary,
+        tone_profile: ToneProfile | None = None,
+    ) -> DraftGenerationResult:
+        """
+        Convert the existing orchestrator LLM response into a Draft.
+
+        This compatibility method lets AgentOrchestrator use the draft module
+        without changing the current frontend payload shape. It is used until
+        Shruthi's summary/priority/suggested_action JSON is fully connected.
+        """
+        subject, body = parse_draft_response(
+            llm_response_text,
+            default_subject="Draft",
+        )
+
+        draft = Draft(
+            recipient=recipient or "",
+            cc=[],
+            subject=subject,
+            body=body,
+            context_summary=context_summary,
+            tone_profile_used=(
+                tone_profile_to_summary(tone_profile) if tone_profile else None
+            ),
+            generated_from_instruction=instruction_text,
+        )
+
+        return DraftGenerationResult(
+            draft=draft,
+            draft_type="full",
+            confidence_score=0.75,
+            needs_human_input=False,
+            human_prompt=None,
+            safety_notes=[
+                "Draft only; no email action performed.",
+                "Draft must pass approval workflow before sending.",
+                "Generated through DraftGenerator compatibility path.",
+            ],
+        )
+    
     @staticmethod
     def _default_reply_subject(subject: str) -> str:
         subject = subject.strip() or "Draft"

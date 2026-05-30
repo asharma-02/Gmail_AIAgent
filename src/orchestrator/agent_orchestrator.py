@@ -50,6 +50,7 @@ from src.permissions.permission_manager import PermissionManager
 from src.prompt.sanitiser import PromptSanitiser
 from src.scheduling.scheduled_draft_manager import ScheduledDraftManager
 from src.tone.tone_profile_engine import ToneProfileEngine
+from src.drafts import DraftGenerator
 
 logger = logging.getLogger(__name__)
 
@@ -129,6 +130,7 @@ class AgentOrchestrator:
         self._audit_logger = audit_logger
         self._scheduled_draft_manager = scheduled_draft_manager
         self._llm_client = llm_client
+        self._draft_generator = DraftGenerator()
 
         # Per-session conversation history: session_id → list[ConversationTurn]
         self._conversation_history: dict[str, list[ConversationTurn]] = {}
@@ -568,18 +570,26 @@ class AgentOrchestrator:
         )
 
         # ------------------------------------------------------------------
-        # Build Draft (Req 1.1)
+        # Build Draft via Akbar's DraftGenerator module (Req 1.1)
         # ------------------------------------------------------------------
-        draft = Draft(
+        draft_result = self._draft_generator.generate_from_orchestrator_response(
             recipient=recipient_email or "",
-            subject=_extract_subject_from_llm_response(llm_response_text),
-            body=_extract_body_from_llm_response(llm_response_text),
+            llm_response_text=llm_response_text,
+            instruction_text=instruction.text,
             context_summary=context_summary,
-            tone_profile_used=(
-                _tone_profile_to_summary(tone_profile) if tone_profile else None
-            ),
-            generated_from_instruction=instruction.text,
+            tone_profile=tone_profile,
         )
+
+        if draft_result.draft is None:
+            return AgentResponse(
+                session_id=session_id,
+                type=AgentResponseType.INFO,
+                payload=draft_result.model_dump(),
+                success=True,
+                message=draft_result.human_prompt or "Human review required.",
+            )
+
+        draft = draft_result.draft
 
         # Log DRAFT_CREATED (Req 12.1)
         self._audit_logger.log(
