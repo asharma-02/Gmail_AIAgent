@@ -13,6 +13,10 @@ dependencies = [
     "google-auth-oauthlib==1.2.0",
     "google-api-python-client==2.128.0",
     "google-generativeai==0.7.2",
+    "fastapi==0.111.0",
+    "uvicorn[standard]==0.29.0",
+    "python-multipart==0.0.9",
+    "python-dotenv>=1.0.0",
 ]
 
 [project.optional-dependencies]

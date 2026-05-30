@@ -12,6 +12,7 @@ Design invariants:
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 
 from src.models.types import AuditEntry, AuditEventType
@@ -22,19 +23,17 @@ _MAX_METADATA_VALUE_LENGTH = 500
 
 class AuditLogger:
     """
-    In-memory, append-only audit log.
-
-    Thread-safety: not guaranteed — callers are responsible for
-    external synchronisation if used from multiple threads.
+    Append-only audit log — writes to both memory and SQLite.
     """
 
     def __init__(self) -> None:
-        # Private list — no public method exposes a mutable reference.
         self._entries: list[AuditEntry] = []
-
-    # ------------------------------------------------------------------
-    # Write
-    # ------------------------------------------------------------------
+        # Initialise DB (no-op if already exists)
+        try:
+            from src.db.database import init_db
+            init_db()
+        except Exception:
+            pass
 
     def log(
         self,
@@ -43,32 +42,11 @@ class AuditLogger:
         description: str,
         metadata: dict[str, str] | None = None,
     ) -> AuditEntry:
-        """
-        Append a new audit log entry and return it.
-
-        Required fields
-        ---------------
-        - event_type  — must be a valid AuditEventType
-        - session_id  — must be a non-empty string
-        - description — must be a non-empty string
-        - timestamp   — set automatically to UTC now
-
-        Metadata
-        --------
-        Each metadata value is silently truncated to 500 characters so
-        that full email bodies can never be stored in the audit log.
-
-        Raises
-        ------
-        ValueError
-            If session_id or description is empty.
-        """
         if not session_id or not session_id.strip():
             raise ValueError("session_id must not be empty")
         if not description or not description.strip():
             raise ValueError("description must not be empty")
 
-        # Sanitise metadata: truncate values that exceed the limit.
         safe_metadata: dict[str, str] = {}
         if metadata:
             for key, value in metadata.items():
@@ -82,13 +60,23 @@ class AuditLogger:
             metadata=safe_metadata,
         )
 
-        # Append-only: we never modify existing entries.
         self._entries.append(entry)
-        return entry
 
-    # ------------------------------------------------------------------
-    # Read
-    # ------------------------------------------------------------------
+        # Persist to SQLite
+        try:
+            from src.db.database import append_audit_entry
+            append_audit_entry(
+                entry_id=entry.entry_id,
+                event_type=entry.event_type.value,
+                timestamp=entry.timestamp,
+                session_id=entry.session_id,
+                description=entry.description,
+                metadata=json.dumps(entry.metadata),
+            )
+        except Exception:
+            pass  # never let DB errors break the audit flow
+
+        return entry
 
     def query(
         self,
@@ -96,31 +84,34 @@ class AuditLogger:
         event_type: AuditEventType | None = None,
         limit: int | None = None,
     ) -> list[AuditEntry]:
-        """
-        Return audit entries in reverse-chronological order.
+        """Query from SQLite so results survive restarts."""
+        try:
+            from src.db.database import query_audit_log
+            rows = query_audit_log(
+                session_id=session_id,
+                event_type=event_type.value if event_type else None,
+                limit=limit,
+            )
+            result = []
+            for row in rows:
+                result.append(AuditEntry(
+                    entry_id=row["entry_id"],
+                    event_type=AuditEventType(row["event_type"]),
+                    timestamp=datetime.fromisoformat(row["timestamp"]),
+                    session_id=row["session_id"],
+                    description=row["description"],
+                    metadata=json.loads(row["metadata"]),
+                ))
+            return result
+        except Exception:
+            # Fall back to in-memory
+            results = list(self._entries)
+            if session_id:
+                results = [e for e in results if e.session_id == session_id]
+            if event_type:
+                results = [e for e in results if e.event_type == event_type]
+            results.sort(key=lambda e: e.timestamp, reverse=True)
+            if limit:
+                results = results[:limit]
+            return results
 
-        Filters
-        -------
-        session_id  — if provided, only entries for that session are returned
-        event_type  — if provided, only entries of that type are returned
-        limit       — if provided, at most this many entries are returned
-                      (the most recent N after filtering)
-
-        Returns an empty list if no entries match.
-        """
-        results: list[AuditEntry] = list(self._entries)
-
-        # Apply filters.
-        if session_id is not None:
-            results = [e for e in results if e.session_id == session_id]
-        if event_type is not None:
-            results = [e for e in results if e.event_type == event_type]
-
-        # Sort descending by timestamp (most recent first).
-        results.sort(key=lambda e: e.timestamp, reverse=True)
-
-        # Apply limit.
-        if limit is not None:
-            results = results[:limit]
-
-        return results

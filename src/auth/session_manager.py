@@ -229,6 +229,19 @@ class SessionManager:
         )
         self._sessions[session.session_id] = session
 
+        # Persist to DB
+        try:
+            from src.db.database import save_session
+            save_session(
+                session_id=session.session_id,
+                user_id=user_id,
+                created_at=now,
+                last_active_at=now,
+                expires_at=session.expires_at,
+            )
+        except Exception:
+            pass
+
         self._log_audit(
             AuditEventType.SESSION_STARTED,
             session_id=session.session_id,
@@ -239,26 +252,26 @@ class SessionManager:
 
     def _verify_credentials(self, user_id: str, credentials: dict) -> bool:
         """
-        Verify user credentials.
-
-        This is a placeholder implementation. In production this would
-        delegate to an identity provider (e.g. LDAP, SSO, password hash
-        comparison). For testing purposes, credentials must contain
-        ``{"password": <value>}`` and the user store must have a matching
-        ``{"expected_password": <value>}`` entry.
-
-        The method intentionally accepts any non-empty user_id + credentials
-        dict that contains a ``"password"`` key, so that unit tests can
-        exercise the happy path without a real identity provider.
+        Verify user credentials against Firestore.
+        Returns False if user doesn't exist (no auto-creation on login).
         """
         if not user_id or not isinstance(credentials, dict):
             return False
         password = credentials.get("password")
         if not password:
             return False
-        # In a real system: look up the user and compare hashed passwords.
-        # Here we accept any non-empty password for a non-empty user_id.
-        return True
+
+        try:
+            from src.db.database import verify_user, update_last_login, get_user
+            user = get_user(user_id)
+            if user is None:
+                return False  # user doesn't exist — must register first
+            if not verify_user(user_id, password):
+                return False  # wrong password
+            update_last_login(user_id)
+            return True
+        except Exception:
+            return False
 
     def validate_session(self, session_id: str) -> SessionContext:
         """
@@ -304,6 +317,14 @@ class SessionManager:
         # Refresh the inactivity window
         session.last_active_at = now
         session.expires_at = self._make_expires_at()
+
+        # Persist updated activity to DB
+        try:
+            from src.db.database import update_session_activity
+            update_session_activity(session.session_id, now, session.expires_at)
+        except Exception:
+            pass
+
         return session
 
     def initiate_gmail_oauth(self, session_id: str) -> str:

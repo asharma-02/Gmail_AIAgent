@@ -220,6 +220,10 @@ class AgentOrchestrator:
             response = self._handle_schedule_instruction(validated_ctx, instruction)
         elif instruction_type == "cancel_schedule":
             response = self._handle_cancel_schedule_instruction(validated_ctx, instruction)
+        elif instruction_type == "confirm_schedule":
+            response = self._handle_confirm_schedule_instruction(validated_ctx, instruction)
+        elif instruction_type == "confirm_send":
+            response = self._handle_confirm_send_instruction(validated_ctx, instruction)
         else:
             response = AgentResponse(
                 session_id=session_id,
@@ -405,7 +409,6 @@ class AgentOrchestrator:
                                 "purpose": "tone_derivation",
                             },
                         )
-                        # Track sent history as a data source for ContextSummary (Req 13.1)
                         data_sources.append(
                             DataSourceReference(
                                 source=DataSource.GMAIL,
@@ -425,9 +428,83 @@ class AgentOrchestrator:
                         exc,
                     )
 
-            tone_profile = self._tone_engine.get_or_derive_profile(
-                recipient_email=recipient_email,
-                gmail_history=gmail_history,
+            # Always re-derive from latest Gmail history so new sent emails are reflected
+            if gmail_history:
+                from src.models.types import ToneProfile as _TP
+                tone_profile = self._tone_engine._derive_from_history(
+                    recipient_email, gmail_history
+                )
+                self._tone_engine.save_profile(tone_profile)
+            else:
+                tone_profile = self._tone_engine.get_or_derive_profile(
+                    recipient_email=recipient_email,
+                    gmail_history=gmail_history,
+                )
+
+        # ------------------------------------------------------------------
+        # Merge meeting notes into context if provided (Req 9.2)
+        # ------------------------------------------------------------------
+        meeting_notes_raw = None
+        if isinstance(instruction.payload, dict):
+            meeting_notes_raw = instruction.payload.get("meeting_notes")
+
+        if meeting_notes_raw:
+            notes_result = self._prompt_builder.sanitise_content(
+                raw=meeting_notes_raw,
+                source=ContentSource.MEETING_NOTES,
+            )
+            if isinstance(notes_result, InjectionAlert):
+                self._audit_logger.log(
+                    event_type=AuditEventType.PROMPT_INJECTION_DETECTED,
+                    session_id=session_id,
+                    description=(
+                        "Prompt injection detected in meeting notes "
+                        f"(confidence={notes_result.scan_result.confidence.value})"
+                    ),
+                    metadata={
+                        "source": ContentSource.MEETING_NOTES.value,
+                        "patterns": ", ".join(notes_result.scan_result.patterns[:5]),
+                    },
+                )
+                from src.models.types import SanitisedContent as _SC
+                notes_sanitised = _SC(
+                    original=notes_result.original_content,
+                    sanitised=notes_result.sanitised_content,
+                    source=ContentSource.MEETING_NOTES,
+                    wrapped_for_llm=notes_result.sanitised_content,
+                )
+            else:
+                notes_sanitised = notes_result
+
+            # Merge with any existing Gmail context
+            if sanitised_context is not None:
+                from src.models.types import SanitisedContent as _SC2
+                merged = (
+                    sanitised_context.wrapped_for_llm
+                    + "\n\n"
+                    + notes_sanitised.wrapped_for_llm
+                )
+                sanitised_context = _SC2(
+                    original=sanitised_context.original,
+                    sanitised=sanitised_context.sanitised,
+                    source=sanitised_context.source,
+                    wrapped_for_llm=merged,
+                )
+            else:
+                sanitised_context = notes_sanitised
+
+            self._audit_logger.log(
+                event_type=AuditEventType.MEETING_NOTES_ACCESSED,
+                session_id=session_id,
+                description="Meeting notes attached by user for draft generation",
+                metadata={"char_count": str(len(meeting_notes_raw))},
+            )
+            data_sources.append(
+                DataSourceReference(
+                    source=DataSource.MEETING_NOTES,
+                    description="Meeting notes (user-attached)",
+                    item_count=1,
+                )
             )
 
         # ------------------------------------------------------------------
@@ -459,6 +536,19 @@ class AgentOrchestrator:
                 payload=None,
                 success=False,
                 message=f"Draft generation failed: {exc}",
+            )
+
+        # ------------------------------------------------------------------
+        # Check if LLM needs clarification instead of drafting
+        # ------------------------------------------------------------------
+        if llm_response_text.strip().startswith("CLARIFICATION_NEEDED:"):
+            clarification = llm_response_text.strip()[len("CLARIFICATION_NEEDED:"):].strip()
+            return AgentResponse(
+                session_id=session_id,
+                type=AgentResponseType.INFO,
+                payload=None,
+                success=True,
+                message=clarification,
             )
 
         # ------------------------------------------------------------------
@@ -533,7 +623,25 @@ class AgentOrchestrator:
         Requirements: 5.1, 5.2, 5.3, 5.4, 5.5
         """
         session_id = session_ctx.session_id
-        draft: Draft = instruction.payload
+
+        # Payload arrives as a dict from the frontend JSON — coerce to Draft
+        raw_payload = instruction.payload
+        if isinstance(raw_payload, dict):
+            # Handle both {draft_id: ..., recipient: ...} and {draft: {...}}
+            if "draft_id" in raw_payload:
+                draft = Draft(**raw_payload)
+            elif "draft" in raw_payload and isinstance(raw_payload["draft"], dict):
+                draft = Draft(**raw_payload["draft"])
+            else:
+                return AgentResponse(
+                    session_id=session_id,
+                    type=AgentResponseType.ERROR,
+                    payload=None,
+                    success=False,
+                    message="Invalid send payload — could not extract draft.",
+                )
+        else:
+            draft = raw_payload
 
         # Log that the approval gate is being presented (Req 12.1)
         self._audit_logger.log(
@@ -547,48 +655,18 @@ class AgentOrchestrator:
             },
         )
 
-        decision = self._approval_gate.present_send_gate(
-            draft=draft,
-            context_summary=draft.context_summary,
-        )
-
-        if decision == ApprovalDecision.CONFIRMED:
-            # Send the email via Gmail (Req 5.3)
-            sent_message_id = self._gmail_client.send_message(
-                to=draft.recipient,
-                subject=draft.subject,
-                body=draft.body,
-                cc=draft.cc if draft.cc else None,
-            )
-
-            # Log EMAIL_SENT (Req 12.1)
-            self._audit_logger.log(
-                event_type=AuditEventType.EMAIL_SENT,
-                session_id=session_id,
-                description=f"Email sent to '{draft.recipient}' (subject: '{draft.subject}')",
-                metadata={
-                    "draft_id": draft.draft_id,
-                    "recipient": draft.recipient,
-                    "subject": draft.subject,
-                    "sent_message_id": sent_message_id,
-                },
-            )
-
-            return AgentResponse(
-                session_id=session_id,
-                type=AgentResponseType.SEND_CONFIRMED,
-                payload={"sent_message_id": sent_message_id, "draft": draft},
-                success=True,
-                message=f"Email sent successfully to {draft.recipient}.",
-            )
-
-        # CANCELLED — do not send (Req 5.4)
+        # Return approval gate to UI — user must confirm before sending
         return AgentResponse(
             session_id=session_id,
-            type=AgentResponseType.CANCELLED,
-            payload=None,
+            type=AgentResponseType.APPROVAL_GATE,
+            payload={
+                "gate_type": "send",
+                "draft": draft.model_dump(mode="json"),
+                "recipient": draft.recipient,
+                "subject": draft.subject,
+            },
             success=True,
-            message="Send cancelled. Returning to draft view.",
+            message=f"Ready to send email to {draft.recipient}. Please confirm or cancel.",
         )
 
     # ------------------------------------------------------------------
@@ -685,7 +763,9 @@ class AgentOrchestrator:
         Handle a "schedule" instruction type.
 
         Flow:
-        1. Extract draft and send_time from instruction.payload dict.
+        1. If payload already contains a pre-built draft+send_time dict, use it.
+           Otherwise, generate a draft via LLM from the instruction text and
+           parse the send time from the instruction text.
         2. Log APPROVAL_GATE_PRESENTED.
         3. Present the schedule approval gate.
         4. On CONFIRMED: register the scheduled draft, log SCHEDULED_DRAFT_REGISTERED,
@@ -696,8 +776,53 @@ class AgentOrchestrator:
         """
         session_id = session_ctx.session_id
         payload = instruction.payload
-        draft: Draft = payload["draft"]
-        send_time = payload["send_time"]
+
+        # ------------------------------------------------------------------
+        # Step 1: Resolve draft and send_time
+        # ------------------------------------------------------------------
+        if isinstance(payload, dict) and "draft" in payload and "send_time" in payload:
+            # Pre-built payload from an API caller — skip straight to registration
+            draft: Draft = payload["draft"]
+            send_time = payload["send_time"]
+
+            # Register immediately (already confirmed by caller)
+            scheduled_draft = self._scheduled_draft_manager.register_scheduled_draft(
+                draft=draft,
+                send_time=send_time,
+            )
+            self._audit_logger.log(
+                event_type=AuditEventType.SCHEDULED_DRAFT_REGISTERED,
+                session_id=session_id,
+                description=(
+                    f"Scheduled draft registered: id='{scheduled_draft.scheduled_draft_id}', "
+                    f"send_time={send_time.isoformat()}"
+                ),
+                metadata={
+                    "scheduled_draft_id": scheduled_draft.scheduled_draft_id,
+                    "draft_id": draft.draft_id,
+                    "recipient": draft.recipient,
+                    "send_time": send_time.isoformat(),
+                },
+            )
+            return AgentResponse(
+                session_id=session_id,
+                type=AgentResponseType.SCHEDULE_CONFIRMED,
+                payload=scheduled_draft,
+                success=True,
+                message=(
+                    f"Draft scheduled for delivery to {draft.recipient} "
+                    f"at {send_time.isoformat()}."
+                ),
+            )
+
+        # Natural-language schedule request — generate draft via LLM first,
+        # then return an approval gate response for the user to confirm.
+        draft_response = self._handle_draft_instruction(session_ctx, instruction)
+        if not draft_response.success or draft_response.type != AgentResponseType.DRAFT:
+            return draft_response  # propagate LLM/permission errors
+
+        draft = draft_response.payload
+        send_time = _parse_send_time_from_instruction(instruction.text)
 
         # Log that the approval gate is being presented (Req 12.1)
         self._audit_logger.log(
@@ -715,52 +840,194 @@ class AgentOrchestrator:
             },
         )
 
-        decision = self._approval_gate.present_schedule_gate(
-            draft=draft,
-            scheduled_time=send_time,
-        )
-
-        if decision == ApprovalDecision.CONFIRMED:
-            # Register the scheduled draft (Req 7.3)
-            scheduled_draft = self._scheduled_draft_manager.register_scheduled_draft(
-                draft=draft,
-                send_time=send_time,
-            )
-
-            # Log SCHEDULED_DRAFT_REGISTERED (Req 12.1)
-            self._audit_logger.log(
-                event_type=AuditEventType.SCHEDULED_DRAFT_REGISTERED,
-                session_id=session_id,
-                description=(
-                    f"Scheduled draft registered: id='{scheduled_draft.scheduled_draft_id}', "
-                    f"send_time={send_time.isoformat()}"
-                ),
-                metadata={
-                    "scheduled_draft_id": scheduled_draft.scheduled_draft_id,
-                    "draft_id": draft.draft_id,
-                    "recipient": draft.recipient,
-                    "send_time": send_time.isoformat(),
-                },
-            )
-
-            return AgentResponse(
-                session_id=session_id,
-                type=AgentResponseType.SCHEDULE_CONFIRMED,
-                payload=scheduled_draft,
-                success=True,
-                message=(
-                    f"Draft scheduled for delivery to {draft.recipient} "
-                    f"at {send_time.isoformat()}."
-                ),
-            )
-
-        # CANCELLED — do not register (Req 7.2)
+        # Return the gate to the UI — the user must confirm before we register
         return AgentResponse(
             session_id=session_id,
-            type=AgentResponseType.CANCELLED,
-            payload=None,
+            type=AgentResponseType.APPROVAL_GATE,
+            payload={
+                "gate_type": "schedule",
+                "draft": draft.model_dump(mode="json"),
+                "send_time": send_time.isoformat(),
+                "recipient": draft.recipient,
+                "subject": draft.subject,
+            },
             success=True,
-            message="Schedule cancelled.",
+            message=(
+                f"Ready to schedule email to {draft.recipient} "
+                f"at {send_time.strftime('%Y-%m-%d %H:%M UTC')}. "
+                f"Please confirm or cancel."
+            ),
+        )
+
+    # ------------------------------------------------------------------
+    # Confirm send instruction handler
+    # ------------------------------------------------------------------
+
+    def _handle_confirm_send_instruction(
+        self,
+        session_ctx: SessionContext,
+        instruction: UserInstruction,
+    ) -> AgentResponse:
+        """
+        Handle a "confirm_send" instruction — user confirmed the send gate.
+
+        If Gmail is configured, sends via API. Otherwise logs and confirms.
+        """
+        session_id = session_ctx.session_id
+        raw_payload = instruction.payload
+
+        if not isinstance(raw_payload, dict) or "draft" not in raw_payload:
+            return AgentResponse(
+                session_id=session_id,
+                type=AgentResponseType.ERROR,
+                payload=None,
+                success=False,
+                message="Invalid confirm_send payload.",
+            )
+
+        draft = Draft(**raw_payload["draft"])
+
+        if self._gmail_client is not None:
+            sent_message_id = self._gmail_client.send_message(
+                to=draft.recipient,
+                subject=draft.subject,
+                body=draft.body,
+                cc=draft.cc if draft.cc else None,
+            )
+        else:
+            # Gmail not configured — simulate send
+            sent_message_id = "simulated_" + draft.draft_id
+
+        self._audit_logger.log(
+            event_type=AuditEventType.EMAIL_SENT,
+            session_id=session_id,
+            description=f"Email sent to '{draft.recipient}' (subject: '{draft.subject}')",
+            metadata={
+                "draft_id": draft.draft_id,
+                "recipient": draft.recipient,
+                "subject": draft.subject,
+                "sent_message_id": sent_message_id,
+            },
+        )
+
+        gmail_note = "" if self._gmail_client else " (Gmail not connected — simulated)"
+
+        # Update tone profile with the sent email (Req 2.6)
+        if draft.recipient:
+            try:
+                from src.models.types import EmailMessage as _EM
+                from datetime import datetime as _dt2, timezone as _tz
+                sent_email_msg = _EM.model_validate({
+                    "message_id": sent_message_id,
+                    "thread_id": "",
+                    "from": session_ctx.user_id,
+                    "to": [draft.recipient],
+                    "cc": draft.cc or [],
+                    "subject": draft.subject,
+                    "body": draft.body,
+                    "sent_at": _dt2.now(tz=_tz.utc),
+                    "labels": ["SENT"],
+                })
+                existing = self._tone_engine.get_profile(draft.recipient)
+                if existing:
+                    self._tone_engine.update_profile(draft.recipient, sent_email_msg)
+                else:
+                    self._tone_engine.get_or_derive_profile(
+                        recipient_email=draft.recipient,
+                        gmail_history=[sent_email_msg],
+                    )
+            except Exception as exc:
+                logger.warning("Failed to update tone profile after send: %s", exc)
+
+        return AgentResponse(
+            session_id=session_id,
+            type=AgentResponseType.SEND_CONFIRMED,
+            payload={"sent_message_id": sent_message_id},
+            success=True,
+            message=f"Email sent to {draft.recipient}.{gmail_note}",
+        )    # ------------------------------------------------------------------
+    # Confirm schedule instruction handler
+    # ------------------------------------------------------------------
+
+    def _handle_confirm_schedule_instruction(
+        self,
+        session_ctx: SessionContext,
+        instruction: UserInstruction,
+    ) -> AgentResponse:
+        """
+        Handle a "confirm_schedule" instruction — user confirmed the gate.
+
+        Expects instruction.payload to be a dict with:
+          - "draft": dict (serialised Draft)
+          - "send_time": ISO string
+        """
+        from datetime import datetime as _dt
+
+        session_id = session_ctx.session_id
+        payload = instruction.payload
+
+        if not isinstance(payload, dict) or "draft" not in payload or "send_time" not in payload:
+            return AgentResponse(
+                session_id=session_id,
+                type=AgentResponseType.ERROR,
+                payload=None,
+                success=False,
+                message="Invalid confirm_schedule payload.",
+            )
+
+        draft = Draft(**payload["draft"])
+        send_time = _dt.fromisoformat(payload["send_time"])
+
+        scheduled_draft = self._scheduled_draft_manager.register_scheduled_draft(
+            draft=draft,
+            send_time=send_time,
+        )
+
+        # Create a Gmail draft immediately so it appears in the user's Drafts folder
+        gmail_draft_id = None
+        if self._gmail_client is not None:
+            try:
+                gmail_draft_id = self._gmail_client.create_draft(
+                    to=draft.recipient,
+                    subject=draft.subject,
+                    body=draft.body,
+                    cc=draft.cc if draft.cc else None,
+                )
+                logger.info(
+                    "Gmail draft created for scheduled send: gmail_draft_id=%s", gmail_draft_id
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to create Gmail draft for scheduled send session=%s: %s",
+                    session_id, exc,
+                )
+
+        self._audit_logger.log(
+            event_type=AuditEventType.SCHEDULED_DRAFT_REGISTERED,
+            session_id=session_id,
+            description=(
+                f"Scheduled draft registered: id='{scheduled_draft.scheduled_draft_id}', "
+                f"send_time={send_time.isoformat()}"
+            ),
+            metadata={
+                "scheduled_draft_id": scheduled_draft.scheduled_draft_id,
+                "draft_id": draft.draft_id,
+                "recipient": draft.recipient,
+                "send_time": send_time.isoformat(),
+                **({"gmail_draft_id": gmail_draft_id} if gmail_draft_id else {}),
+            },
+        )
+
+        gmail_note = f" A draft has been saved to your Gmail Drafts folder." if gmail_draft_id else ""
+        return AgentResponse(
+            session_id=session_id,
+            type=AgentResponseType.SCHEDULE_CONFIRMED,
+            payload=scheduled_draft,
+            success=True,
+            message=(
+                f"Draft scheduled for delivery to {draft.recipient} "
+                f"at {send_time.strftime('%Y-%m-%d %H:%M UTC')}.{gmail_note}"
+            ),
         )
 
     # ------------------------------------------------------------------
@@ -877,6 +1144,92 @@ class AgentOrchestrator:
 
 
 def _extract_recipient_from_instruction(text: str) -> str | None:
+    """
+    Attempt to extract a recipient email address from the instruction text.
+
+    Looks for patterns like "to alice@example.com" or bare email addresses.
+    Returns None if no email address is found.
+    """
+    import re
+
+    # Look for an email address in the instruction text
+    match = re.search(r"[\w.+-]+@[\w-]+\.[a-zA-Z]{2,}", text)
+    if match:
+        return match.group(0)
+    return None
+
+
+def _parse_send_time_from_instruction(text: str) -> datetime:
+    """
+    Parse a send time from a natural-language instruction.
+
+    Handles common patterns like:
+    - "tomorrow at 9am"
+    - "in 2 hours"
+    - "at 3pm"
+    - "next Monday at 10am"
+
+    Falls back to 1 hour from now if no recognisable time expression is found.
+    """
+    import re
+    from datetime import timedelta
+
+    now = datetime.now(tz=timezone.utc)
+    text_lower = text.lower()
+
+    # "in X hours/minutes"
+    m = re.search(r"in\s+(\d+)\s+(hour|hr|minute|min)s?", text_lower)
+    if m:
+        amount = int(m.group(1))
+        unit = m.group(2)
+        delta = timedelta(hours=amount) if unit in ("hour", "hr") else timedelta(minutes=amount)
+        return now + delta
+
+    # Extract hour from "at Xam/pm" or "at X:YY am/pm"
+    hour: int | None = None
+    minute: int = 0
+    m = re.search(r"at\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?", text_lower)
+    if m:
+        hour = int(m.group(1))
+        minute = int(m.group(2)) if m.group(2) else 0
+        meridiem = m.group(3)
+        if meridiem == "pm" and hour != 12:
+            hour += 12
+        elif meridiem == "am" and hour == 12:
+            hour = 0
+
+    # Determine the base date
+    base = now
+    if "tomorrow" in text_lower:
+        base = now + timedelta(days=1)
+    elif "next monday" in text_lower:
+        days_ahead = (0 - now.weekday()) % 7 or 7
+        base = now + timedelta(days=days_ahead)
+    elif "next tuesday" in text_lower:
+        days_ahead = (1 - now.weekday()) % 7 or 7
+        base = now + timedelta(days=days_ahead)
+    elif "next wednesday" in text_lower:
+        days_ahead = (2 - now.weekday()) % 7 or 7
+        base = now + timedelta(days=days_ahead)
+    elif "next thursday" in text_lower:
+        days_ahead = (3 - now.weekday()) % 7 or 7
+        base = now + timedelta(days=days_ahead)
+    elif "next friday" in text_lower:
+        days_ahead = (4 - now.weekday()) % 7 or 7
+        base = now + timedelta(days=days_ahead)
+
+    if hour is not None:
+        send_time = base.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        # If the computed time is in the past, push it forward by a day
+        if send_time <= now:
+            send_time += timedelta(days=1)
+        return send_time
+
+    # Default: 1 hour from now
+    return now + timedelta(hours=1)
+
+
+
     """
     Attempt to extract a recipient email address from the instruction text.
 

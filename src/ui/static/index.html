@@ -1,0 +1,325 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ADA Agent — Secure AI Executive Assistant</title>
+  <link rel="stylesheet" href="/static/style.css" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
+</head>
+<body>
+
+<!-- ── Login Screen ──────────────────────────────────────────── -->
+<div id="login-screen">
+  <div class="login-box">
+    <div class="login-logo">
+      <div class="login-logo-icon">✦</div>
+      <h2>ADA Agent</h2>
+    </div>
+
+    <!-- Tabs -->
+    <div class="auth-tabs">
+      <button class="auth-tab active" id="tab-signin" onclick="switchAuthTab('signin')">Sign In</button>
+      <button class="auth-tab" id="tab-signup" onclick="switchAuthTab('signup')">Sign Up</button>
+    </div>
+
+    <div class="login-error" id="login-error"></div>
+
+    <!-- Sign In Form -->
+    <div id="form-signin">
+      <div class="form-group">
+        <label class="form-label" for="login-user">Email</label>
+        <input class="form-input" id="login-user" type="email"
+               placeholder="Enter your email" autocomplete="email" />
+      </div>
+      <div class="form-group">
+        <label class="form-label" for="login-pass">Password</label>
+        <input class="form-input" id="login-pass" type="password"
+               placeholder="Enter your password" autocomplete="current-password" />
+      </div>
+      <button class="btn btn-primary" style="width:100%;justify-content:center;"
+              id="login-btn" onclick="doLogin()">
+        Sign In
+      </button>
+    </div>
+
+    <!-- Sign Up Form -->
+    <div id="form-signup" style="display:none;">
+      <div class="form-group">
+        <label class="form-label" for="signup-user">Email</label>
+        <input class="form-input" id="signup-user" type="email"
+               placeholder="Enter your email" autocomplete="email" />
+      </div>
+      <div class="form-group">
+        <label class="form-label" for="signup-pass">Password</label>
+        <input class="form-input" id="signup-pass" type="password"
+               placeholder="Create a password (min 6 characters)" autocomplete="new-password" />
+      </div>
+      <div class="form-group">
+        <label class="form-label" for="signup-pass2">Confirm Password</label>
+        <input class="form-input" id="signup-pass2" type="password"
+               placeholder="Confirm your password" autocomplete="new-password" />
+      </div>
+      <button class="btn btn-primary" style="width:100%;justify-content:center;"
+              id="signup-btn" onclick="doSignUp()">
+        Create Account
+      </button>
+    </div>
+
+  </div>
+</div>
+
+<!-- ── Main App ───────────────────────────────────────────────── -->
+<div id="app" style="display:none;">
+
+  <!-- Sidebar -->
+  <aside class="sidebar">
+    <div class="sidebar-logo">
+      <div class="sidebar-logo-row">
+        <div class="sidebar-logo-icon">✦</div>
+        <h1>ADA Agent</h1>
+      </div>
+      <div class="sidebar-logo-sub">AI Executive Assistant</div>
+    </div>
+
+    <div class="nav-section">
+      <div class="nav-section-label">Workspace</div>
+      <button class="nav-item active" onclick="showView('dashboard')" id="nav-dashboard">
+        <span class="nav-icon">⬡</span> Dashboard
+      </button>
+      <button class="nav-item" onclick="showView('chat')" id="nav-chat">
+        <span class="nav-icon">◈</span> Chat with Agent
+      </button>
+    </div>
+
+    <div class="nav-section">
+      <div class="nav-section-label">Email</div>
+      <button class="nav-item" onclick="showView('scheduled')" id="nav-scheduled">
+        <span class="nav-icon">◷</span> Scheduled Drafts
+      </button>
+      <button class="nav-item" onclick="showView('tone')" id="nav-tone">
+        <span class="nav-icon">◈</span> Tone Profiles
+      </button>
+    </div>
+
+    <div class="nav-section">
+      <div class="nav-section-label">Security</div>
+      <button class="nav-item" onclick="showView('audit')" id="nav-audit">
+        <span class="nav-icon">◉</span> Audit Log
+      </button>
+    </div>
+
+    <div class="sidebar-footer">
+      <div class="user-row">
+        <div class="user-avatar" id="user-avatar">?</div>
+        <div class="user-info">
+          <div class="user-name" id="session-user-label">Not logged in</div>
+          <div class="user-status">
+            <span class="status-dot offline" id="session-dot"></span>
+            <span id="session-status-text">Offline</span>
+          </div>
+        </div>
+      </div>
+      <button class="btn btn-secondary btn-sm" style="width:100%;justify-content:center;"
+              onclick="doLogout()">
+        Sign Out
+      </button>
+    </div>
+  </aside>
+
+  <!-- Main -->
+  <div class="main">
+    <div class="topbar">
+      <span class="topbar-title" id="topbar-title">Dashboard</span>
+      <div class="topbar-actions">
+        <button class="btn btn-primary btn-sm" id="new-chat-btn"
+                onclick="showView('chat')" style="display:none;">
+          ✦ New Chat
+        </button>
+      </div>
+    </div>
+
+    <div class="content">
+
+      <!-- ── Dashboard View ──────────────────────────────────── -->
+      <div class="view active" id="view-dashboard">
+
+        <div class="stats-grid" id="stats-grid">
+          <div class="stat-card">
+            <div class="stat-label">Audit Events</div>
+            <div class="stat-value" id="stat-audit">—</div>
+            <div class="stat-sub">Total logged</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Scheduled Drafts</div>
+            <div class="stat-value" id="stat-scheduled">—</div>
+            <div class="stat-sub">Pending / total</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Tone Profiles</div>
+            <div class="stat-value" id="stat-tone">—</div>
+            <div class="stat-sub">Recipients learned</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Session</div>
+            <div class="stat-value" style="font-size:16px;padding-top:6px;" id="stat-session">Active</div>
+            <div class="stat-sub" id="stat-user">—</div>
+          </div>
+        </div>
+
+        <div class="quick-compose-card">
+          <div class="quick-compose-text">
+            <h3>✦ Quick Compose</h3>
+            <p>Draft a new email with AI assistance — just describe what you need.</p>
+          </div>
+          <button class="btn btn-primary" onclick="showView('chat')">Open Chat →</button>
+        </div>
+
+        <div class="card">
+          <div class="card-header">
+            <div>
+              <div class="card-title">Recent Activity</div>
+              <div class="card-subtitle">Last 10 events across all sessions</div>
+            </div>
+            <button class="btn btn-sm btn-secondary" onclick="loadDashboard()">↻ Refresh</button>
+          </div>
+          <div class="activity-feed" id="dashboard-activity-feed">
+            <div class="empty-state" style="padding:24px 0;">
+              <div class="empty-icon">◉</div>
+              <p>Loading activity…</p>
+            </div>
+          </div>
+        </div>
+
+      </div><!-- /view-dashboard -->
+
+      <!-- ── Chat View ────────────────────────────────────────── -->
+      <div class="view" id="view-chat">
+        <div class="chat-container">
+          <div class="chat-messages" id="chat-messages">
+            <div class="chat-message agent">
+              <div class="chat-avatar">A</div>
+              <div class="chat-bubble">
+                <div class="msg-type draft">Agent Ready</div>
+                Hello! I'm ADA Agent, your Secure AI Executive Assistant. I can help you
+                draft emails, schedule sends, manage your inbox — all with
+                human-in-the-loop approval for every sensitive action.<br/><br/>
+                Try: <em>"Draft an email to alice@example.com about the Q4 planning meeting"</em>
+              </div>
+            </div>
+          </div>
+
+          <div class="chat-input-area">
+            <div class="instruction-type-row">
+              <span style="font-size:11px;color:var(--text-muted);align-self:center;margin-right:4px;">Mode:</span>
+              <button class="type-chip active" onclick="setInstructionType('draft', this)">✉ Draft</button>
+              <button class="type-chip" onclick="setInstructionType('schedule', this)">🗓 Schedule</button>
+              <button class="type-chip" onclick="setInstructionType('cancel_schedule', this)">✖ Cancel</button>
+            </div>
+            <div class="chat-input-row">
+              <label class="attach-btn" title="Attach meeting notes" for="notes-file-input">
+                📎
+                <input type="file" id="notes-file-input" accept=".txt,.md"
+                  style="display:none;" onchange="handleNotesAttachment(event)" />
+              </label>
+              <div class="attach-preview" id="attach-preview" style="display:none;">
+                <span id="attach-filename"></span>
+                <button class="attach-remove" onclick="removeAttachment()" title="Remove">✕</button>
+              </div>
+              <textarea class="form-textarea" id="chat-input"
+                placeholder="Describe what you need… (Enter to send, Shift+Enter for new line)"
+                rows="2" onkeydown="handleChatKey(event)"></textarea>
+              <button class="btn btn-primary" id="send-btn" onclick="sendInstruction()">Send</button>
+            </div>
+          </div>
+        </div>
+      </div><!-- /view-chat -->
+
+      <!-- ── Scheduled Drafts View ──────────────────────────── -->
+      <div class="view" id="view-scheduled">
+        <div class="card">
+          <div class="card-header">
+            <div>
+              <div class="card-title">Scheduled Drafts</div>
+              <div class="card-subtitle">Drafts queued for future delivery — never auto-sent</div>
+            </div>
+            <div style="display:flex;gap:8px;align-items:center;">
+              <select class="form-select" id="schedule-filter"
+                      onchange="loadScheduled()" style="width:160px;">
+                <option value="">All statuses</option>
+                <option value="pending">Pending</option>
+                <option value="awaiting_confirmation">Awaiting Confirmation</option>
+                <option value="sent">Sent</option>
+                <option value="cancelled">Cancelled</option>
+                <option value="held">Held</option>
+              </select>
+              <button class="btn btn-sm btn-secondary" onclick="loadScheduled()">↻ Refresh</button>
+            </div>
+          </div>
+          <div class="drafts-grid" id="scheduled-grid">
+            <div class="empty-state">
+              <div class="empty-icon">◷</div>
+              <p>Loading scheduled drafts…</p>
+            </div>
+          </div>
+        </div>
+      </div><!-- /view-scheduled -->
+
+      <!-- ── Tone Profiles View ─────────────────────────────── -->
+      <div class="view" id="view-tone">
+        <div class="card">
+          <div class="card-header">
+            <div>
+              <div class="card-title">Tone Profiles</div>
+              <div class="card-subtitle">Writing style learned from sent email history per recipient</div>
+            </div>
+            <button class="btn btn-sm btn-secondary" onclick="loadToneProfiles()">↻ Refresh</button>
+          </div>
+          <div id="tone-profiles-container">
+            <div class="empty-state">
+              <div class="empty-icon">◈</div>
+              <p>Loading tone profiles…</p>
+            </div>
+          </div>
+        </div>
+      </div><!-- /view-tone -->
+
+      <!-- ── Audit Log View ─────────────────────────────────── -->
+      <div class="view" id="view-audit">
+        <div class="card">
+          <div class="card-header">
+            <div>
+              <div class="card-title">Audit Log</div>
+              <div class="card-subtitle">Append-only tamper-evident record of all agent actions</div>
+            </div>
+            <button class="btn btn-sm btn-secondary" onclick="loadAuditLog()">↻ Refresh</button>
+          </div>
+          <div class="audit-filter-bar">
+            <input class="form-input" id="audit-session-filter"
+                   placeholder="Filter by session ID…" style="max-width:260px;" />
+            <select class="form-select" id="audit-event-filter" style="max-width:220px;">
+              <option value="">All event types</option>
+            </select>
+            <button class="btn btn-secondary" onclick="loadAuditLog()">Filter</button>
+          </div>
+          <div class="audit-timeline" id="audit-timeline">
+            <div class="empty-state" style="padding:24px 0;">
+              <div class="empty-icon">◉</div>
+              <p>Loading audit events…</p>
+            </div>
+          </div>
+        </div>
+      </div><!-- /view-audit -->
+
+    </div><!-- /content -->
+  </div><!-- /main -->
+</div><!-- /app -->
+
+<!-- Toast container -->
+<div id="toast-container"></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

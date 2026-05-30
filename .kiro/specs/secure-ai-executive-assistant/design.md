@@ -1,20 +1,26 @@
-# Design Document: Secure AI Executive Assistant
+# Design Document: ADA Agent
 
 ## Overview
 
-The Secure AI Executive Assistant is a safety-first AI agent that helps business professionals manage email workflows. It integrates with Gmail via OAuth 2.0 to draft emails, retrieve context, adapt writing tone per recipient, extract meeting note insights, and prepare scheduled sends — all under strict human-in-the-loop controls.
+ADA Agent is a safety-first AI assistant that helps business professionals manage email workflows. It integrates with Gmail via OAuth 2.0 to draft emails, retrieve context, adapt writing tone per recipient, extract meeting note insights, and prepare scheduled sends — all under strict human-in-the-loop controls.
 
 The central design principle is **trust hierarchy**: the system distinguishes sharply between trusted user instructions (received through the authenticated session channel) and untrusted external content (email bodies, meeting notes, documents). No content from external sources is ever interpreted as an instruction. Every sensitive action requires an explicit user approval gate before execution.
 
 ### Key Design Decisions
 
 - **Gmail-only integration**: Simplifies the OAuth scope surface and reduces attack vectors. No other email platform is in scope.
-- **Incremental OAuth authorisation**: Scopes are requested at the point of need, not all at once at login. This follows Google's recommended best practice and gives users fine-grained control.
-- **Tone Profiles as persistent, incrementally-updated records**: Profiles are stored in a local database, built from sent history analysis, and updated after each confirmed send — avoiding expensive re-analysis on every session.
-- **Active confirmation for scheduled sends**: When a scheduled send time arrives, the user must click a confirm button. There is no passive cancel window. This prevents emails from being sent without the user's active attention.
-- **LLM Provider — Google Gemini 1.5 Flash (free tier)**: Accessed via the `google-generativeai` Python SDK using a Gemini API key from Google AI Studio. The free tier supports up to 15 requests/min and 1 million tokens/day, sufficient for development and moderate production use. No billing account required.
-
-- **Dual-layer prompt injection defence**: Untrusted content is sanitised before being placed in the LLM context, and the system prompt enforces strict role separation so the LLM treats retrieved content as data, not instructions.
+- **Incremental OAuth authorisation**: Scopes are requested at the point of need, not all at once at login.
+- **Tone Profiles as persistent, incrementally-updated records**: Profiles are stored in a local database, built from sent history analysis, and updated after each confirmed send.
+- **Active confirmation for scheduled sends**: When a scheduled send time arrives, the user must click a confirm button. There is no passive cancel window.
+- **LLM Provider — Google Gemini 2.5 Flash**: Accessed via the `google-generativeai` Python SDK using a Gemini API key from Google AI Studio. Configurable via `GEMINI_MODEL` in `.env`.
+- **Dual-layer prompt injection defence**: Untrusted content is sanitised before being placed in the LLM context, and the system prompt enforces strict role separation. The LLM is instructed to respond with `CLARIFICATION_NEEDED:` if it cannot extract usable content, preventing placeholder draft emails.
+- **Two-step approval gate flow**: Sensitive actions (send, schedule) return an `APPROVAL_GATE` response to the UI. The user confirms via a dedicated `confirm_send` or `confirm_schedule` instruction type, which then executes the action. This replaces the previous synchronous callback pattern that always defaulted to CANCELLED.
+- **Meeting notes via file attachment**: Users can attach `.txt` or `.md` files in the chat interface. Binary formats (PDF, DOCX) are rejected client-side with a message to paste as plain text.
+- **SQLite persistence**: User accounts, sessions, and audit log entries are persisted to `data/ada_agent.db`. The database layer is isolated in `src/db/database.py` to allow future migration to Google Cloud Firestore or Cloud SQL without changes to other components.
+- **Branding**: The application is named **ADA Agent**.
+- **Google Cloud Firestore persistence**: User accounts, sessions, and audit log entries are persisted to Google Cloud Firestore (`ada-database` in project `project-22d2752d-0ba4-4e77-bb8`). The database layer is isolated in `src/db/database.py` — swapping backends requires only replacing this file.
+- **Explicit user registration**: Users must register with a unique email address and password before they can log in. Auto-creation of accounts on login is disabled. The login screen has separate Sign In and Sign Up tabs.
+- **Per-user data isolation**: All data (audit log, tone profiles, sessions) is scoped to the authenticated user's email address (`user_id`).
 
 The system follows a layered architecture with a clear trust boundary between the user-facing layer and the external data layer.
 
@@ -156,8 +162,19 @@ The central coordinator. Receives user instructions, coordinates all subsystems,
 - Parse and validate user instructions (from authenticated session only)
 - Coordinate permission checks before any data access
 - Route requests to appropriate subsystems
-- Enforce approval gates before sensitive actions
+- Return `APPROVAL_GATE` responses to the UI for send and schedule actions (never auto-executing)
+- Handle `confirm_send` and `confirm_schedule` instruction types to execute confirmed actions
 - Maintain conversation context within a session
+- Detect `CLARIFICATION_NEEDED:` prefix in LLM responses and return them as `INFO` responses instead of drafts
+
+**Instruction Types:**
+- `draft` — generate an email draft via LLM
+- `send` — present send approval gate (returns `APPROVAL_GATE` response)
+- `confirm_send` — execute send after user confirmation
+- `schedule` — generate draft via LLM, parse send time, present schedule approval gate
+- `confirm_schedule` — register scheduled draft after user confirmation
+- `delete` — present delete approval gate
+- `cancel_schedule` — cancel a registered scheduled draft
 
 **Interface:**
 ```
@@ -170,22 +187,30 @@ The critical security component that enforces the trust boundary between externa
 
 **Responsibilities:**
 - Construct LLM prompts with strict role separation
-- Sanitise all untrusted content before inclusion in prompts
+- Sanitise all untrusted content before inclusion in prompts (email bodies, meeting notes)
 - Detect instruction-like patterns in untrusted content
-- Wrap untrusted content in explicit data-context delimiters
+- Wrap untrusted content in explicit `<untrusted_content>` data-context delimiters
 - Never allow untrusted content to appear in the system prompt or instruction role
+- Instruct the LLM to respond with `CLARIFICATION_NEEDED:` when context is unreadable or insufficient
 
 **Sanitisation Strategy:**
 1. **Pattern detection**: Scan for instruction-like patterns (imperative verbs targeting the agent, role-override phrases, permission escalation language, delimiter injection attempts)
-2. **Contextual wrapping**: Wrap all external content in explicit XML-style delimiters that the system prompt instructs the LLM to treat as data only: `<untrusted_content source="gmail">...</untrusted_content>`
-3. **Injection flagging**: If high-confidence injection patterns are detected, flag the content, log the event, and notify the user before proceeding
+2. **Contextual wrapping**: Wrap all external content in `<untrusted_content source="...">...</untrusted_content>` delimiters
+3. **Injection flagging**: If high-confidence injection patterns are detected, flag the content, log the event, and notify the user
 4. **Content truncation**: Enforce maximum token limits on untrusted content to prevent context overflow attacks
+5. **Clarification protocol**: System prompt instructs LLM to respond with `CLARIFICATION_NEEDED: <reason>` instead of generating a placeholder draft when context is insufficient
+
+**Meeting Notes Handling:**
+- Only `.txt` and `.md` files are accepted (enforced client-side)
+- Content is passed through `sanitise_content()` with `source=MEETING_NOTES`
+- Merged with any existing Gmail context in the `data_context` section of the LLM prompt
+- Logged as `MEETING_NOTES_ACCESSED` in the audit log
 
 **Interface:**
 ```
-buildDraftPrompt(instruction: UserInstruction, context: SanitisedContext, toneProfile: ToneProfile) → LLMPrompt
-sanitiseContent(raw: string, source: ContentSource) → SanitisedContent | InjectionAlert
-detectInjectionPatterns(content: string) → InjectionScanResult
+buildDraftPrompt(instruction, context, toneProfile) → LLMPrompt
+sanitiseContent(raw, source) → SanitisedContent | InjectionAlert
+detectInjectionPatterns(content, source) → InjectionScanResult
 ```
 
 ### 5. Tone Profile Engine
@@ -252,13 +277,14 @@ triggerSendTimeConfirmation(id: ScheduledDraftId) → void
 
 ### 8. Audit Logger
 
-Maintains a tamper-evident record of all agent actions.
+Maintains a tamper-evident, persistent record of all agent actions.
 
 **Responsibilities:**
 - Record all specified event types with timestamp and description
 - Prevent modification or deletion of log entries by the agent or untrusted content
 - Provide filtered, reverse-chronological log views to the user
 - Exclude unnecessary sensitive content (no full email bodies in logs)
+- Persist all entries to SQLite via `src/db/database.py`; fall back to in-memory if DB is unavailable
 
 **Logged Event Types:**
 `DRAFT_CREATED`, `EMAIL_CONTEXT_ACCESSED`, `MEETING_NOTES_ACCESSED`, `PERMISSION_GRANTED`, `PERMISSION_REVOKED`, `APPROVAL_GATE_PRESENTED`, `EMAIL_SENT`, `EMAIL_DELETED`, `SCHEDULED_DRAFT_REGISTERED`, `SCHEDULED_DRAFT_CANCELLED`, `PROMPT_INJECTION_DETECTED`, `AUTH_FAILED`, `SESSION_STARTED`, `SESSION_EXPIRED`, `GMAIL_TOKEN_REVOKED`
@@ -268,6 +294,35 @@ Maintains a tamper-evident record of all agent actions.
 log(event: AuditEvent) → void
 query(filter: AuditFilter) → AuditEntry[]
 ```
+
+### 10. Database Layer (`src/db/database.py`)
+
+Isolated persistence layer backed by **Google Cloud Firestore**. All storage operations go through this module — replacing it is sufficient to migrate to a different backend.
+
+**Firestore Collections:**
+- `users` — user_id (email), password_hash (SHA-256), created_at, last_login_at
+- `sessions` — session_id, user_id, created_at, last_active_at, expires_at, is_active
+- `audit_log` — entry_id, event_type, timestamp, session_id, description, metadata (map)
+
+**Key operations:**
+```
+init_db() → void
+create_user(user_id, password) → bool   # returns False if email already exists
+verify_user(user_id, password) → bool
+get_user(user_id) → dict | None
+save_session(session_id, user_id, ...) → void
+update_session_activity(session_id, ...) → void
+append_audit_entry(entry_id, event_type, ...) → void
+query_audit_log(session_id?, event_type?, limit?) → list[dict]
+```
+
+**Configuration:** `GOOGLE_CLOUD_PROJECT` and `FIRESTORE_DATABASE` in `.env`. Credentials via Application Default Credentials (ADC) — run `gcloud auth application-default login` once.
+
+**Registration flow:**
+- `POST /api/auth/register` — validates unique email, minimum password length, password confirmation; creates user in Firestore; returns session
+- `POST /api/auth/login` — verifies email exists and password matches; returns session; rejects unknown emails (no auto-creation)
+
+**UI:** Login screen has Sign In / Sign Up tabs. Sign Up requires email, password (min 6 chars), and password confirmation.
 
 ### 9. Gmail API Client
 
